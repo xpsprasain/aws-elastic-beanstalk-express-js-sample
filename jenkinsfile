@@ -2,16 +2,16 @@ pipeline {
   agent any
 
   environment {
-    // ---- change to your Docker Hub namespace ----
-    REGISTRY_NS       = 'xpsprasain/aws-elastic-beanstalk-express-js-sample'
+    // ---- Docker Hub ----
+    REGISTRY_NS       = 'docker.io/xpsprasain/aws-elastic-beanstalk-express-js-sample'  
     IMAGE             = 'eb-express-ci'
     TAG               = "b${env.BUILD_NUMBER}"
 
-    // ---- where to clone the APP from ----
+    // ---- App repo to build ----
     APP_REPO_URL      = 'https://github.com/xpsprasain/aws-elastic-beanstalk-express-js-sample.git'
     APP_BRANCH        = 'main'
 
-    // ---- talk to your DinD (hostname must be 'docker') ----
+    // ---- Talk to DinD over TLS ----
     DOCKER_HOST       = 'tcp://docker:2376'
     DOCKER_TLS_VERIFY = '1'
     DOCKER_CERT_PATH  = '/certs/client'
@@ -23,16 +23,16 @@ pipeline {
   }
 
   stages {
-    stage('Checkout APP into subfolder') {
+    stage('Checkout APP into app/') {
       steps {
         deleteDir()
         dir('app') {
           git url: "${APP_REPO_URL}", branch: "${APP_BRANCH}", changelog: false, poll: false
         }
         sh '''
-          echo "Workspace content:"
+          echo "Workspace top:"
           ls -la | head
-          echo "App content:"
+          echo "App folder:"
           ls -la app | head
           test -f app/package.json || { echo "ERROR: app/package.json not found"; exit 2; }
         '''
@@ -40,9 +40,7 @@ pipeline {
     }
 
     stage('Prep base image (optional)') {
-      steps {
-        sh 'docker pull node:16-alpine || true'
-      }
+      steps { sh 'docker pull node:16-alpine || true' }
     }
 
     stage('Install dependencies (Node 16)') {
@@ -70,11 +68,7 @@ pipeline {
             "
         '''
       }
-      post {
-        always {
-          junit testResults: '**/test-results/*.xml', allowEmptyResults: true
-        }
-      }
+      post { always { junit testResults: '**/test-results/*.xml', allowEmptyResults: true } }
     }
 
     stage('Dependency security scan (Snyk)') {
@@ -87,8 +81,7 @@ pipeline {
                 npm install --save
                 npm install -g snyk
                 snyk auth $SNYK_TOKEN
-                # Fail build if High/Critical found (assignment requirement)
-                snyk test --severity-threshold=high
+                snyk test --severity-threshold=high    # fail on High/Critical
               "
           '''
         }
@@ -110,7 +103,7 @@ pipeline {
       environment { DOCKER_BUILDKIT = '1' }
       steps {
         sh '''
-          # If the app repo has no Dockerfile, create a minimal one
+          # Use app/Dockerfile if present; otherwise create a minimal one
           if [ ! -f app/Dockerfile ]; then
             cat > app/Dockerfile <<'EOF'
 FROM node:16-alpine
@@ -146,10 +139,9 @@ EOF
   }
 
   post {
-    always {
-      archiveArtifacts artifacts: 'app/Dockerfile', allowEmptyArchive: true
-    }
-    success { echo "Built & pushed $REGISTRY_NS/$IMAGE:$TAG" }
-    failure { echo "Build failed — open the failing stage log for details." }
+    always { archiveArtifacts artifacts: 'app/Dockerfile', allowEmptyArchive: true }
+    success { echo "✅ Built & pushed $REGISTRY_NS/$IMAGE:$TAG" }
+    failure { echo "❌ Build failed — open the failing stage’s console log." }
   }
 }
+
