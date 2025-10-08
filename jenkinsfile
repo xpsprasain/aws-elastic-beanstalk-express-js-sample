@@ -3,7 +3,7 @@ pipeline {
 
   environment {
     // ---- change to your Docker Hub namespace ----
-    REGISTRY_NS       = 'docker.io/xpsprasain'
+    REGISTRY_NS       = 'xpsprasain/aws-elastic-beanstalk-express-js-sample'
     IMAGE             = 'eb-express-ci'
     TAG               = "b${env.BUILD_NUMBER}"
 
@@ -149,7 +149,7 @@ EOF
     always {
       archiveArtifacts artifacts: 'app/Dockerfile', allowEmptyArchive: true
     }
-    success { echo "✅ Built & pushed $REGISTRY_NS/$IMAGE:$TAG" }
-    failure { echo "❌ Build failed — open the failing stage log for details." }
+    success { echo "Built & pushed $REGISTRY_NS/$IMAGE:$TAG" }
+    failure { echo "Build failed — open the failing stage log for details." }
   }
 }
