@@ -7,7 +7,7 @@ pipeline {
     TAG         = "${env.BUILD_NUMBER}"
 
     // Docker-in-Docker endpoint (service name from your compose)
-    DOCKER_HOST       = 'tcp://dind:2376'
+    DOCKER_HOST       = 'tcp://docker:2376'
     DOCKER_TLS_VERIFY = '1'
     DOCKER_CERT_PATH  = '/certs/client'
   }
