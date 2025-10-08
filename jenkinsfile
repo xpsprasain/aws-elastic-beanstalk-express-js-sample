@@ -30,19 +30,20 @@ pipeline {
 
     stage('Install dependencies (Node 16)') {
       steps {
-        sh '''
-          docker run --rm \
-            --network bridge \
-            -u 0:0 \
-            -v "$WORKSPACE":/workspace \
-            -v "$WORKSPACE/.npm":/root/.npm \
-            -w /workspace \
-            node:16 sh -lc '
-              node -v
-              npm -v
-              npm install --save
-            '
-        '''
+      	withEnv(DOCKER_ENV) {
+		sh '''
+		  docker run --rm \
+		    --network bridge \
+		    -u 0:0 \
+		    -v "$WORKSPACE":/workspace \
+		    -v "$WORKSPACE/.npm":/root/.npm \
+		    -w /workspace node:16-alpine sh -lc '
+		      node -v
+		      npm -v
+		      (npm ci || npm install --save
+		    '
+		'''
+	}
       }
     }
 
