@@ -1,137 +1,111 @@
+// Jenkinsfile — Node 16 CI/CD + Snyk gate + logging & retention
 pipeline {
   agent any
-
-  environment {
-    // ---- Docker Hub ----
-    REGISTRY_NS       = 'docker.io/xpsprasain/aws-elastic-beanstalk-express-js-sample'  
-    IMAGE             = 'eb-express-ci'
-    TAG               = "b${env.BUILD_NUMBER}"
-
-    // ---- App repo to build ----
-    APP_REPO_URL      = 'https://github.com/xpsprasain/aws-elastic-beanstalk-express-js-sample.git'
-    APP_BRANCH        = 'main'
-
-    // ---- Talk to DinD over TLS ----
-    DOCKER_HOST       = 'tcp://docker:2376'
-    DOCKER_TLS_VERIFY = '1'
-    DOCKER_CERT_PATH  = '/certs/client'
-  }
-
   options {
     timestamps()
-    buildDiscarder(logRotator(numToKeepStr: '25'))
+    buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '10'))
+  }
+
+  environment {
+    // EDIT: your Docker Hub repo (username/repo)
+    IMAGE_NAME = 'srijanpyakural/aws-elastic-beanstalk-express-js-sample'
+    IMAGE_TAG  = "build-${env.BUILD_NUMBER}"
   }
 
   stages {
-    stage('Checkout APP into app/') {
-      steps {
-        deleteDir()
-        dir('app') {
-          git url: "${APP_REPO_URL}", branch: "${APP_BRANCH}", changelog: false, poll: false
-        }
-        sh '''
-          echo "Workspace top:"
-          ls -la | head
-          echo "App folder:"
-          ls -la app | head
-          test -f app/package.json || { echo "ERROR: app/package.json not found"; exit 2; }
-        '''
-      }
+    stage('Checkout') {
+      steps { checkout scm }
     }
 
-    stage('Prep base image (optional)') {
-      steps { sh 'docker pull node:16-alpine || true' }
-    }
-
-    stage('Install dependencies (Node 16)') {
-      steps {
-        sh '''
-          docker run --rm -u 0:0 \
-            -v "$WORKSPACE/app":/workspace \
-            -v "$WORKSPACE/.npm":/root/.npm \
-            -w /workspace node:16-alpine sh -lc '
-              node -v
-              npm -v
-              (npm ci || npm install --save)
-            '
-        '''
-      }
-    }
-
-    stage('Unit tests (Node 16)') {
-      steps {
-        sh '''
-          docker run --rm -u 0:0 \
-            -v "$WORKSPACE/app":/workspace \
-            -w /workspace node:16-alpine sh -lc "
-              npm test --if-present || echo 'no tests; continuing'
-            "
-        '''
-      }
-      post { always { junit testResults: '**/test-results/*.xml', allowEmptyResults: true } }
-    }
-
-    stage('Dependency security scan (Snyk)') {
-      steps {
-        withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
-          sh '''
-            docker run --rm -u 0:0 \
-              -v "$WORKSPACE/app":/workspace \
-              -w /workspace node:16-alpine sh -lc "
-                npm install --save
-                npm install -g snyk
-                snyk auth $SNYK_TOKEN
-                snyk test --severity-threshold=high    # fail on High/Critical
-              "
-          '''
+    stage('Install & Test (Node 16)') {
+      agent {
+        docker {
+          image 'node:16'              // Debian-based for reliability
+          args '-u root:root'
+          reuseNode true
         }
       }
-      post {
-        always {
-          sh '''
-            set +e
-            docker run --rm -u 0:0 -v "$WORKSPACE/app":/workspace -w /workspace node:16-alpine sh -lc "
-              npm install -g snyk && snyk test --severity-threshold=high --json > snyk-report.json || true
-            "
-          '''
-          archiveArtifacts artifacts: 'snyk-report.json', fingerprint: true, onlyIfSuccessful: false
-        }
+      steps {
+        sh 'node -v && npm -v | tee -a node-version.log'
+        sh 'if [ -f package-lock.json ]; then npm ci 2>&1 | tee npm-install.log; else npm install --save 2>&1 | tee npm-install.log; fi'
+        sh '(npm test 2>&1 | tee npm-test.log) || echo "No unit tests found — continuing" | tee -a npm-test.log'
+        stash name: 'ws', includes: '**/*'
       }
     }
 
-    stage('Build Docker image') {
-      environment { DOCKER_BUILDKIT = '1' }
+    stage('Snyk Scan (fail on High/Critical)') {
+      agent {
+        docker {
+          image 'node:16'
+          args '-u root:root'
+          reuseNode true
+        }
+      }
+      environment {
+        SNYK_TOKEN = credentials('snyk-token')   // Secret text credential
+        // If your Snyk region is EU/AU, set this as a global Jenkins env:
+        // SNYK_API = 'https://api.eu.snyk.io'
+        // SNYK_API = 'https://api.au.snyk.io'
+      }
       steps {
+        // POSIX-safe (no pipefail). Preserve Snyk exit code but still archive logs.
         sh '''
-          # Use app/Dockerfile if present; otherwise create a minimal one
-          if [ ! -f app/Dockerfile ]; then
-            cat > app/Dockerfile <<'EOF'
-FROM node:16-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci --only=production || npm install --only=production
-COPY . .
-EXPOSE 8080
-CMD ["npm","start"]
-EOF
+          set -eu
+
+          echo "Installing Snyk CLI…"
+          npm install -g snyk >/dev/null 2>&1 || npm install -g snyk
+          echo "Snyk CLI version: $(snyk --version)"
+
+          # Non-interactive auth (no browser/device flow)
+          if [ -z "${SNYK_TOKEN:-}" ]; then
+            echo "ERROR: SNYK_TOKEN missing (credential id: snyk-token)"
+            exit 2
+          fi
+          snyk config set api="$SNYK_TOKEN" >/dev/null
+
+          if [ -n "${SNYK_API:-}" ]; then
+            echo "Using Snyk API endpoint: $SNYK_API"
+          else
+            echo "Using default Snyk API endpoint"
           fi
 
-          docker version
-          docker build -t $REGISTRY_NS/$IMAGE:$TAG -f app/Dockerfile app
-          docker tag  $REGISTRY_NS/$IMAGE:$TAG $REGISTRY_NS/$IMAGE:latest
+          # Quick auth check (no secrets printed)
+          if ! snyk auth --status >/dev/null 2>&1; then
+            echo "ERROR: Snyk auth failed (token/region)."
+            exit 2
+          fi
+
+          # Run the security test and capture its real exit code
+          snyk test --severity-threshold=high > snyk.log 2>&1
+          status=$?
+          cat snyk.log
+
+          # Also write a JSON report for artifacts (do not change build result)
+          snyk test --severity-threshold=high --json-file-output=snyk-report.json || true
+
+          exit $status
         '''
       }
     }
 
-    stage('Push to Docker Hub') {
+    stage('Build Image') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
+        unstash 'ws'
+        sh 'docker build --progress=plain -t $IMAGE_NAME:$IMAGE_TAG . 2>&1 | tee docker-build.log'
+      }
+    }
+
+    stage('Login & Push to Registry') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-cred',
                                           usernameVariable: 'DOCKER_USER',
                                           passwordVariable: 'DOCKER_PASS')]) {
           sh '''
+            set -eu
             echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
-            docker push $REGISTRY_NS/$IMAGE:$TAG
-            docker push $REGISTRY_NS/$IMAGE:latest
+            docker push $IMAGE_NAME:$IMAGE_TAG
+            docker tag  $IMAGE_NAME:$IMAGE_TAG $IMAGE_NAME:latest
+            docker push $IMAGE_NAME:latest
           '''
         }
       }
@@ -139,9 +113,23 @@ EOF
   }
 
   post {
-    always { archiveArtifacts artifacts: 'app/Dockerfile', allowEmptyArchive: true }
-    success { echo "✅ Built & pushed $REGISTRY_NS/$IMAGE:$TAG" }
-    failure { echo "❌ Build failed — open the failing stage’s console log." }
+    always {
+      // Record image digest (provenance), if available
+      sh 'docker image inspect $IMAGE_NAME:$IMAGE_TAG --format=\'{{json .RepoDigests}}\' > image-digests.json || true'
+      archiveArtifacts artifacts: '''
+        Jenkinsfile,
+        Dockerfile,
+        node-version.log,
+        npm-install.log,
+        npm-test.log,
+        snyk.log,
+        snyk-report.json,
+        docker-build.log,
+        image-digests.json
+      '''.trim().replaceAll('\\s+', ' ')
+      fingerprint 'image-digests.json'
+    }
   }
 }
+
 
