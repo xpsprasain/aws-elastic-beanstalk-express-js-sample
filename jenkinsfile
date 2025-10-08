@@ -2,25 +2,22 @@ pipeline {
   agent any
 
   environment {
-    // ---- image coordinates ----
-    REGISTRY_NS = 'docker.io/xpsprasain'          
-    IMAGE       = 'eb-express-ci'                 
-    TAG         = "b${env.BUILD_NUMBER}"
+    REGISTRY_NS = 'docker.io/xpsprasain'      
+    IMAGE       = 'aws-eb-express'              
+    TAG         = "${env.BUILD_NUMBER}"
 
-    // ---- talk to Docker-in-Docker from Task 2 ----
-    DOCKER_HOST       = 'tcp://dind:2376'         
+    // Docker-in-Docker endpoint (service name from your compose)
+    DOCKER_HOST       = 'tcp://dind:2376'
     DOCKER_TLS_VERIFY = '1'
     DOCKER_CERT_PATH  = '/certs/client'
   }
 
   options {
     timestamps()
-    ansiColor('xterm')
     buildDiscarder(logRotator(numToKeepStr: '25'))
   }
 
   stages {
-
     stage('Checkout') {
       steps { checkout scm }
     }
@@ -67,7 +64,6 @@ pipeline {
                 npm install --save
                 npm install -g snyk
                 snyk auth $SNYK_TOKEN
-                # exits non-zero if High/Critical found -> pipeline fails (required)
                 snyk test --severity-threshold=high
               "
           '''
@@ -75,7 +71,6 @@ pipeline {
       }
       post {
         always {
-          // optional JSON for your report
           sh '''
             set +e
             docker run --rm -u 0:0 -v "$WORKSPACE":/ws -w /ws node:16 sh -lc "
@@ -100,7 +95,6 @@ pipeline {
 
     stage('Push Image') {
       steps {
-        // change credentialsId to your Jenkins creds id (e.g., dockerhub-creds)
         withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
                                           usernameVariable: 'DOCKER_USER',
                                           passwordVariable: 'DOCKER_PASS')]) {
@@ -116,7 +110,6 @@ pipeline {
 
   post {
     always {
-      // collect JUnit if present; don’t fail if missing
       junit testResults: '**/test-results/*.xml', allowEmptyResults: true
       archiveArtifacts artifacts: 'Dockerfile', allowEmptyArchive: true
     }
