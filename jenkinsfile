@@ -1,109 +1,113 @@
 pipeline {
-  agent none
+  agent any
+
+  environment {
+    // ---- image coordinates ----
+    REGISTRY_NS = 'docker.io/xpsprasain'          
+    IMAGE       = 'eb-express-ci'                 
+    TAG         = "b${env.BUILD_NUMBER}"
+
+    // ---- talk to Docker-in-Docker from Task 2 ----
+    DOCKER_HOST       = 'tcp://dind:2376'         
+    DOCKER_TLS_VERIFY = '1'
+    DOCKER_CERT_PATH  = '/certs/client'
+  }
 
   options {
     timestamps()
     ansiColor('xterm')
-    buildDiscarder(logRotator(numToKeepStr: '20'))
-  }
-
-  environment {
-    // 👇 CHANGE THIS to your Docker Hub repository
-    IMAGE_NAME = 'xpsprasain/aws-node-app'
-    IMAGE_TAG  = "build-${env.BUILD_NUMBER}"
+    buildDiscarder(logRotator(numToKeepStr: '25'))
   }
 
   stages {
+
     stage('Checkout') {
-      agent any
-      steps {
-        checkout scm
-      }
+      steps { checkout scm }
     }
 
-    stage('Install & Test (Node 16)') {
-      // Assignment requires Node 16 build agent + `npm install --save`
-      agent { docker { image 'node:16' } }
+    stage('Dependencies (Node 16)') {
       steps {
         sh '''
-          node -v
-          npm -v
-          npm install --save
-          # Continue even if there are no tests in the sample app
-          npm test || echo "No tests / tests failed - continuing for assignment requirements"
+          docker run --rm \
+            -u 0:0 \
+            -v "$WORKSPACE":/ws \
+            -v "$WORKSPACE/.npm":/root/.npm \
+            -w /ws \
+            node:16 sh -lc '
+              node -v && npm -v
+              (npm ci || npm install --save)
+            '
         '''
-      }
-      post {
-        always {
-          // If your project emits JUnit XML, they’ll be picked up; else harmless
-          junit '**/test-results/*.xml', allowEmptyResults: true
-        }
       }
     }
 
-    stage('Security Scan (Snyk)') {
-      // Fails the build if High/Critical vulnerabilities exist
-      agent { docker { image 'node:16' } }
+    stage('Unit Tests (Node 16)') {
+      steps {
+        sh '''
+          docker run --rm \
+            -u 0:0 \
+            -v "$WORKSPACE":/ws \
+            -w /ws \
+            node:16 sh -lc "
+              npm test --if-present || echo 'no tests or tests failed; continuing for assignment'
+            "
+        '''
+      }
+    }
+
+    stage('Dependency Scan (Snyk)') {
       steps {
         withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
           sh '''
-            npm install -g snyk
-            snyk auth "$SNYK_TOKEN"
-            # This command exits non-zero if High/Critical issues are found
-            snyk test --severity-threshold=high
+            docker run --rm \
+              -u 0:0 \
+              -v "$WORKSPACE":/ws \
+              -w /ws \
+              node:16 sh -lc "
+                npm install --save
+                npm install -g snyk
+                snyk auth $SNYK_TOKEN
+                # exits non-zero if High/Critical found -> pipeline fails (required)
+                snyk test --severity-threshold=high
+              "
           '''
         }
       }
       post {
         always {
-          // Optional: produce JSON for your report (run separately so the stage still fails properly)
+          // optional JSON for your report
           sh '''
             set +e
-            snyk test --severity-threshold=high --json > snyk-report.json || true
+            docker run --rm -u 0:0 -v "$WORKSPACE":/ws -w /ws node:16 sh -lc "
+              npm install -g snyk && snyk test --severity-threshold=high --json > snyk-report.json || true
+            "
           '''
           archiveArtifacts artifacts: 'snyk-report.json', fingerprint: true, onlyIfSuccessful: false
         }
       }
     }
 
-    stage('Build Docker Image') {
-      // Build via Docker CLI connecting to DinD over TLS (matches your docker-compose)
-      agent {
-        docker {
-          image 'docker:27-cli'
-          args '''
-            -v /certs/client:/certs/client:ro
-            -e DOCKER_HOST=tcp://dind:2376
-            -e DOCKER_TLS_VERIFY=1
-            -e DOCKER_CERT_PATH=/certs/client
-          '''
-        }
-      }
+    stage('Build Image') {
+      environment { DOCKER_BUILDKIT = '1' }
       steps {
-        sh 'docker version'
-        sh 'docker build -t $IMAGE_NAME:$IMAGE_TAG .'
-        sh 'docker tag $IMAGE_NAME:$IMAGE_TAG $IMAGE_NAME:latest'
+        sh '''
+          docker version
+          docker build -t $REGISTRY_NS/$IMAGE:$TAG .
+          docker tag  $REGISTRY_NS/$IMAGE:$TAG $REGISTRY_NS/$IMAGE:latest
+        '''
       }
     }
 
-    stage('Push to Registry') {
-      agent {
-        docker {
-          image 'docker:27-cli'
-          args '''
-            -v /certs/client:/certs/client:ro
-            -e DOCKER_HOST=tcp://dind:2376
-            -e DOCKER_TLS_VERIFY=1
-            -e DOCKER_CERT_PATH=/certs/client
-          '''
-        }
-      }
+    stage('Push Image') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+        // change credentialsId to your Jenkins creds id (e.g., dockerhub-creds)
+        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
+                                          usernameVariable: 'DOCKER_USER',
+                                          passwordVariable: 'DOCKER_PASS')]) {
           sh '''
             echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
-            docker push $IMAGE_NAME:$IMAGE_TAG
-            docker push $IMAGE_NAME:latest
+            docker push $REGISTRY_NS/$IMAGE:$TAG
+            docker push $REGISTRY_NS/$IMAGE:latest
           '''
         }
       }
@@ -111,12 +115,12 @@ pipeline {
   }
 
   post {
-    success {
-      echo '✅ CI complete: install, test, security scan, build & push succeeded.'
+    always {
+      // collect JUnit if present; don’t fail if missing
+      junit testResults: '**/test-results/*.xml', allowEmptyResults: true
+      archiveArtifacts artifacts: 'Dockerfile', allowEmptyArchive: true
     }
-    failure {
-      echo '❌ CI failed — check the failing stage’s console logs.'
-    }
+    success { echo "Built & pushed $REGISTRY_NS/$IMAGE:$TAG" }
+    failure { echo "Build failed — check the failing stage log." }
   }
 }
-
