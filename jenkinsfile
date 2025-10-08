@@ -24,7 +24,7 @@ pipeline {
       steps { 
       	deleteDir()
       	checkout scm 
-      	sh 'ls -la | sed -n "1,80p"'
+      	sh 'ls -la | head'
       	}
     }
 
