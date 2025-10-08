@@ -1,19 +1,28 @@
 pipeline {
   agent none
 
+  options {
+    timestamps()
+    ansiColor('xterm')
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+  }
+
   environment {
+    // 👇 CHANGE THIS to your Docker Hub repository
     IMAGE_NAME = 'xpsprasain/aws-node-app'
-    IMAGE_TAG  = 'latest'
+    IMAGE_TAG  = "build-${env.BUILD_NUMBER}"
   }
 
   stages {
     stage('Checkout') {
       agent any
-      steps { checkout scm }
+      steps {
+        checkout scm
+      }
     }
 
     stage('Install & Test (Node 16)') {
-      // Node 16 build agent as required by the assignment
+      // Assignment requires Node 16 build agent + `npm install --save`
       agent { docker { image 'node:16' } }
       steps {
         sh '''
@@ -21,32 +30,44 @@ pipeline {
           npm -v
           npm install --save
           # Continue even if there are no tests in the sample app
-          npm test || echo "Tests missing/failing - continuing for assignment flow"
+          npm test || echo "No tests / tests failed - continuing for assignment requirements"
         '''
       }
       post {
         always {
+          // If your project emits JUnit XML, they’ll be picked up; else harmless
           junit '**/test-results/*.xml', allowEmptyResults: true
         }
       }
     }
 
     stage('Security Scan (Snyk)') {
-      // Fails build if High/Critical vulns exist
+      // Fails the build if High/Critical vulnerabilities exist
       agent { docker { image 'node:16' } }
       steps {
         withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
           sh '''
             npm install -g snyk
             snyk auth "$SNYK_TOKEN"
+            # This command exits non-zero if High/Critical issues are found
             snyk test --severity-threshold=high
           '''
+        }
+      }
+      post {
+        always {
+          // Optional: produce JSON for your report (run separately so the stage still fails properly)
+          sh '''
+            set +e
+            snyk test --severity-threshold=high --json > snyk-report.json || true
+          '''
+          archiveArtifacts artifacts: 'snyk-report.json', fingerprint: true, onlyIfSuccessful: false
         }
       }
     }
 
     stage('Build Docker Image') {
-      // Build via Docker CLI, talking to DinD over TLS
+      // Build via Docker CLI connecting to DinD over TLS (matches your docker-compose)
       agent {
         docker {
           image 'docker:27-cli'
@@ -61,6 +82,7 @@ pipeline {
       steps {
         sh 'docker version'
         sh 'docker build -t $IMAGE_NAME:$IMAGE_TAG .'
+        sh 'docker tag $IMAGE_NAME:$IMAGE_TAG $IMAGE_NAME:latest'
       }
     }
 
@@ -81,6 +103,7 @@ pipeline {
           sh '''
             echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
             docker push $IMAGE_NAME:$IMAGE_TAG
+            docker push $IMAGE_NAME:latest
           '''
         }
       }
@@ -88,7 +111,12 @@ pipeline {
   }
 
   post {
-    success { echo '✅ CI done: install, test, security scan, build & push complete.' }
-    failure { echo '❌ CI failed — check stage logs above.' }
+    success {
+      echo '✅ CI complete: install, test, security scan, build & push succeeded.'
+    }
+    failure {
+      echo '❌ CI failed — check the failing stage’s console logs.'
+    }
   }
 }
+
