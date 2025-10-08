@@ -1,12 +1,13 @@
 pipeline {
-  agent any
+  agent any 
 
   environment {
-    REGISTRY_NS = 'docker.io/xpsprasain'      
-    IMAGE       = 'aws-eb-express'              
-    TAG         = "${env.BUILD_NUMBER}"
+    
+    REGISTRY   = 'docker.io/xpsprasain'
+    IMAGE_NAME = 'aws-eb-express'
+    IMAGE_TAG  = "${env.BUILD_NUMBER}"
 
-    // Docker-in-Docker endpoint (service name from your compose)
+    // Talk to your DinD from Task 2
     DOCKER_HOST       = 'tcp://docker:2376'
     DOCKER_TLS_VERIFY = '1'
     DOCKER_CERT_PATH  = '/certs/client'
@@ -14,7 +15,8 @@ pipeline {
 
   options {
     timestamps()
-    buildDiscarder(logRotator(numToKeepStr: '25'))
+    ansiColor('xterm')
+    buildDiscarder(logRotator(numToKeepStr: '20'))
   }
 
   stages {
@@ -22,44 +24,49 @@ pipeline {
       steps { checkout scm }
     }
 
-    stage('Dependencies (Node 16)') {
+    stage('Install dependencies (Node 16)') {
       steps {
         sh '''
           docker run --rm \
+            --network bridge \
             -u 0:0 \
-            -v "$WORKSPACE":/ws \
+            -v "$WORKSPACE":/workspace \
             -v "$WORKSPACE/.npm":/root/.npm \
-            -w /ws \
+            -w /workspace \
             node:16 sh -lc '
-              node -v && npm -v
-              (npm ci || npm install --save)
+              node -v
+              npm -v
+              npm install --save
             '
         '''
       }
     }
 
-    stage('Unit Tests (Node 16)') {
+    stage('Unit tests (Node 16)') {
       steps {
         sh '''
           docker run --rm \
+            --network bridge \
             -u 0:0 \
-            -v "$WORKSPACE":/ws \
-            -w /ws \
+            -v "$WORKSPACE":/workspace \
+            -v "$WORKSPACE/.npm":/root/.npm \
+            -w /workspace \
             node:16 sh -lc "
-              npm test --if-present || echo 'no tests or tests failed; continuing for assignment'
+              npm test --if-present
             "
         '''
       }
     }
 
-    stage('Dependency Scan (Snyk)') {
+    stage('Dependency security scan (Snyk)') {
       steps {
-        withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
+        withCredentials([string(credentialsId: 'synk-token', variable: 'SNYK_TOKEN')]) {
           sh '''
             docker run --rm \
+              --network bridge \
               -u 0:0 \
-              -v "$WORKSPACE":/ws \
-              -w /ws \
+              -v "$WORKSPACE":/workspace \
+              -w /workspace \
               node:16 sh -lc "
                 npm install --save
                 npm install -g snyk
@@ -69,39 +76,25 @@ pipeline {
           '''
         }
       }
-      post {
-        always {
-          sh '''
-            set +e
-            docker run --rm -u 0:0 -v "$WORKSPACE":/ws -w /ws node:16 sh -lc "
-              npm install -g snyk && snyk test --severity-threshold=high --json > snyk-report.json || true
-            "
-          '''
-          archiveArtifacts artifacts: 'snyk-report.json', fingerprint: true, onlyIfSuccessful: false
-        }
-      }
     }
 
-    stage('Build Image') {
+    stage('Build Docker image') {
       environment { DOCKER_BUILDKIT = '1' }
       steps {
         sh '''
-          docker version
-          docker build -t $REGISTRY_NS/$IMAGE:$TAG .
-          docker tag  $REGISTRY_NS/$IMAGE:$TAG $REGISTRY_NS/$IMAGE:latest
+          docker build -t $REGISTRY/$IMAGE_NAME:$IMAGE_TAG .
         '''
       }
     }
 
-    stage('Push Image') {
+    stage('Push to Docker Hub') {
       steps {
-        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
-                                          usernameVariable: 'DOCKER_USER',
-                                          passwordVariable: 'DOCKER_PASS')]) {
+        withCredentials([usernamePassword(credentialsId: 'dockerhub', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
           sh '''
             echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
-            docker push $REGISTRY_NS/$IMAGE:$TAG
-            docker push $REGISTRY_NS/$IMAGE:latest
+            docker push $REGISTRY/$IMAGE_NAME:$IMAGE_TAG
+            docker tag  $REGISTRY/$IMAGE_NAME:$IMAGE_TAG $REGISTRY/$IMAGE_NAME:latest
+            docker push $REGISTRY/$IMAGE_NAME:latest
           '''
         }
       }
@@ -110,10 +103,8 @@ pipeline {
 
   post {
     always {
-      junit testResults: '**/test-results/*.xml', allowEmptyResults: true
+      junit testResults: 'reports/junit/*.xml', allowEmptyResults: true
       archiveArtifacts artifacts: 'Dockerfile', allowEmptyArchive: true
     }
-    success { echo "Built & pushed $REGISTRY_NS/$IMAGE:$TAG" }
-    failure { echo "Build failed — check the failing stage log." }
   }
 }
