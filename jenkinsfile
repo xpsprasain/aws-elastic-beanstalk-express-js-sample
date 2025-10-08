@@ -1,13 +1,18 @@
 pipeline {
   agent any
 
-  // Global env so every 'docker' call talks to your DinD over TLS
   environment {
-    REGISTRY_NS       = 'docker.io/xpsprasain'       
-    IMAGE             = 'aws-eb-express'              
-    TAG               = "${env.BUILD_NUMBER}"
+    // ---- change to your Docker Hub namespace ----
+    REGISTRY_NS       = 'docker.io/xpsprasain'
+    IMAGE             = 'eb-express-ci'
+    TAG               = "b${env.BUILD_NUMBER}"
 
-    DOCKER_HOST       = 'tcp://docker:2376'           
+    // ---- where to clone the APP from ----
+    APP_REPO_URL      = 'https://github.com/xpsprasain/aws-elastic-beanstalk-express-js-sample.git'
+    APP_BRANCH        = 'main'
+
+    // ---- talk to your DinD (hostname must be 'docker') ----
+    DOCKER_HOST       = 'tcp://docker:2376'
     DOCKER_TLS_VERIFY = '1'
     DOCKER_CERT_PATH  = '/certs/client'
   }
@@ -18,26 +23,33 @@ pipeline {
   }
 
   stages {
-    stage('Checkout') {
+    stage('Checkout APP into subfolder') {
       steps {
         deleteDir()
-        checkout scm
-        sh 'ls -la | head'    // sanity: should list package.json here
+        dir('app') {
+          git url: "${APP_REPO_URL}", branch: "${APP_BRANCH}", changelog: false, poll: false
+        }
+        sh '''
+          echo "Workspace content:"
+          ls -la | head
+          echo "App content:"
+          ls -la app | head
+          test -f app/package.json || { echo "ERROR: app/package.json not found"; exit 2; }
+        '''
       }
     }
 
-    stage('Prep base image (optional speed-up)') {
+    stage('Prep base image (optional)') {
       steps {
         sh 'docker pull node:16-alpine || true'
       }
     }
 
     stage('Install dependencies (Node 16)') {
-      options { timeout(time: 10, unit: 'MINUTES') }
       steps {
         sh '''
           docker run --rm -u 0:0 \
-            -v "$WORKSPACE":/workspace \
+            -v "$WORKSPACE/app":/workspace \
             -v "$WORKSPACE/.npm":/root/.npm \
             -w /workspace node:16-alpine sh -lc '
               node -v
@@ -52,7 +64,7 @@ pipeline {
       steps {
         sh '''
           docker run --rm -u 0:0 \
-            -v "$WORKSPACE":/workspace \
+            -v "$WORKSPACE/app":/workspace \
             -w /workspace node:16-alpine sh -lc "
               npm test --if-present || echo 'no tests; continuing'
             "
@@ -70,12 +82,12 @@ pipeline {
         withCredentials([string(credentialsId: 'snyk-token', variable: 'SNYK_TOKEN')]) {
           sh '''
             docker run --rm -u 0:0 \
-              -v "$WORKSPACE":/workspace \
+              -v "$WORKSPACE/app":/workspace \
               -w /workspace node:16-alpine sh -lc "
                 npm install --save
                 npm install -g snyk
                 snyk auth $SNYK_TOKEN
-                # Fails pipeline on High/Critical (assignment requirement)
+                # Fail build if High/Critical found (assignment requirement)
                 snyk test --severity-threshold=high
               "
           '''
@@ -83,10 +95,9 @@ pipeline {
       }
       post {
         always {
-          // optional artifact for your report
           sh '''
             set +e
-            docker run --rm -u 0:0 -v "$WORKSPACE":/workspace -w /workspace node:16-alpine sh -lc "
+            docker run --rm -u 0:0 -v "$WORKSPACE/app":/workspace -w /workspace node:16-alpine sh -lc "
               npm install -g snyk && snyk test --severity-threshold=high --json > snyk-report.json || true
             "
           '''
@@ -99,8 +110,21 @@ pipeline {
       environment { DOCKER_BUILDKIT = '1' }
       steps {
         sh '''
+          # If the app repo has no Dockerfile, create a minimal one
+          if [ ! -f app/Dockerfile ]; then
+            cat > app/Dockerfile <<'EOF'
+FROM node:16-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production || npm install --only=production
+COPY . .
+EXPOSE 8080
+CMD ["npm","start"]
+EOF
+          fi
+
           docker version
-          docker build -t $REGISTRY_NS/$IMAGE:$TAG .
+          docker build -t $REGISTRY_NS/$IMAGE:$TAG -f app/Dockerfile app
           docker tag  $REGISTRY_NS/$IMAGE:$TAG $REGISTRY_NS/$IMAGE:latest
         '''
       }
@@ -123,10 +147,9 @@ pipeline {
 
   post {
     always {
-      archiveArtifacts artifacts: 'Dockerfile', allowEmptyArchive: true
+      archiveArtifacts artifacts: 'app/Dockerfile', allowEmptyArchive: true
     }
     success { echo "✅ Built & pushed $REGISTRY_NS/$IMAGE:$TAG" }
-    failure { echo "❌ Build failed — check the failing stage’s console log." }
+    failure { echo "❌ Build failed — open the failing stage log for details." }
   }
 }
-
