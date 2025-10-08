@@ -21,7 +21,11 @@ pipeline {
 
   stages {
     stage('Checkout') {
-      steps { checkout scm }
+      steps { 
+      	deleteDir()
+      	checkout scm 
+      	sh 'ls -la | sed -n "1,80p"'
+      	}
     }
 
     stage('Install dependencies (Node 16)') {
